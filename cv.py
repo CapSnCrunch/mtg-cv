@@ -1,17 +1,20 @@
+import os
 import cv2
+import glob
+import string
+import requests
 import numpy as np
 from PIL import Image
-import pytesseract
+from recognition.mse import meanSquaredError, structuralSimilarity
 
 camera = cv2.VideoCapture(0)
 
-def empty(a):
-    pass
-
-cv2.namedWindow("Parameters")
-cv2.resizeWindow("Parameters", 640, 240)
-cv2.createTrackbar("Threshold1", "Parameters", 150, 255, empty)
-cv2.createTrackbar("Threshold2", "Parameters", 150, 255, empty)
+cardStore = {}
+for file in glob.glob(os.path.dirname(__file__) + '/recognition/cards/*.jpg'):
+    cardName = string.capwords(os.path.basename(file)[:-4].replace('-', ' '))
+    cardStore[cardName] = {}
+    cardStore[cardName]['details'] = None
+    cardStore[cardName]['image'] = np.asarray(Image.open(file))
 
 def rotate(l, n):
     return l[-n:] + l[:-n]
@@ -41,14 +44,14 @@ def getContours(image, imageContour):
         for i in range(int(len(flattenedApprox) / 2)):
             x = flattenedApprox[2*i]
             y = flattenedApprox[2*i+1]
-            string = str(x) + " " + str(y)
+            # string = str(x) + " " + str(y)
             # cv2.putText(imageContour, string, (x, y), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 255, 0))
             points.append([x, y])
 
     return points
 
 def straightenImage(imageContour, points):
-    width, height = 250, 350
+    width, height = 168, 234
 
     if len(points) != 4:
         return imageContour
@@ -61,7 +64,7 @@ def straightenImage(imageContour, points):
     #         minDistanceToOrigin = distance
     #         topLeftIndex = i
     
-    # rotate(points, -topLeftIndex)
+    # rotate(points, -topLeftIndex)     
 
     points1 = np.float32(points)
 
@@ -69,10 +72,52 @@ def straightenImage(imageContour, points):
         points2 = np.float32([[width,0], [0,0], [0,height], [width,height]])
     else:
         points2 = np.float32([[0,0], [0,height], [width,height], [width,0]])
-        print(points)
 
     matrix = cv2.getPerspectiveTransform(points1, points2)
     return cv2.warpPerspective(imageContour, matrix, (width, height))
+
+def getCardDetails(cardName):
+    # Query the scryfall API by card name and cache details
+    if not cardStore[cardName]['details']:
+        response = requests.get('https://api.scryfall.com/cards/named?exact='+cardName.replace(' ', '+'))
+        cardStore[cardName]['details'] = response.json()
+    return cardStore[cardName]['details']
+
+def MSEonImage(image):
+    mostLikelyCard = { 
+        'error': np.infty, 
+        'name': ''
+    }
+    for name, card in cardStore.items():
+        try:
+            mse = meanSquaredError(image, card['image'])
+            # print(f'  {name}: {mse}')
+            if mse < mostLikelyCard['error']:
+                mostLikelyCard = {
+                    'error': mse,
+                    'name': name
+                }
+        except:
+            pass
+    return mostLikelyCard['name']
+
+def SSIMonImage(image):
+    mostLikelyCard = { 
+        'likeness': -1, 
+        'name': ''
+    }
+    for name, card in cardStore.items():
+        try:
+            ssim = structuralSimilarity(image, card['image'])
+            # print(f'  {name}: {ssim}')
+            if ssim > mostLikelyCard['likeness']:
+                mostLikelyCard = {
+                    'likeness': ssim,
+                    'name': name
+                }
+        except:
+            pass
+    return mostLikelyCard['name']
 
 # def OCRonImage(image):
 #     text = pytesseract.image_to_string(Image.fromarray(image))
@@ -87,10 +132,10 @@ while(True):
     frameGray = cv2.cvtColor(frameBlur, cv2.COLOR_BGR2GRAY)
 
     # Canny edge detector
-    threshold1 = cv2.getTrackbarPos("Threshold1", "Parameters")
-    threshold2 = cv2.getTrackbarPos("Threshold2", "Parameters")
-    # threshold1 = 0
-    # threshold2 = 70
+    # threshold1 = cv2.getTrackbarPos("Threshold1", "Parameters")
+    # threshold2 = cv2.getTrackbarPos("Threshold2", "Parameters")
+    threshold1 = 0
+    threshold2 = 70
     frameCanny = cv2.Canny(frameGray, threshold1, threshold2)
 
     kernel = np.ones((5,5))
@@ -99,12 +144,28 @@ while(True):
     points = getContours(frameDilation, frameContour)
     frameStraight = straightenImage(baseFrame, points)
 
-    cv2.imshow('frame', frameContour)
-    cv2.imshow('straight frame', frameStraight)
-
     # print(OCRonImage(frameStraight))
 
+    # msePrediction = MSEonImage(frameStraight)
+    # if msePrediction:
+    #     print(msePrediction)
+
+    ssimPrediction = SSIMonImage(frameStraight)
+    if ssimPrediction:
+        points.sort(key=lambda point: point[0] + point[1])
+        x, y = points[0]
+
+        cardName = ssimPrediction
+        details = getCardDetails(cardName)
+
+        cv2.putText(frameContour, cardName, (x, y - 60), cv2.FONT_HERSHEY_COMPLEX, 0.75, (0, 0, 0))
+        cv2.putText(frameContour, 'Price: $' + details['prices']['usd'], (x, y - 40), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 0))
+        cv2.putText(frameContour, 'Multiverse ID: ' + str(details['multiverse_ids'][0]), (x, y - 20), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 0))
+
+    cv2.imshow('contours', frameContour)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
+        print(cardStore.keys())
         break
 
 camera.release()
